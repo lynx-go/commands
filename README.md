@@ -13,10 +13,12 @@ on the standard library.
 - **Zero dependencies** — pure standard library (`context`, `errors`, `flag`, `fmt`, `io`, `sort`, `strings`)
 - **Declarative flags** — verbs implement `Flagged.SetFlags`; the framework owns FlagSet construction and parse-error mapping, and the flag package's own diagnostics are silenced, so a parse failure renders as a *single* stderr line through the `FlagError` hook. Verbs that don't implement `Flagged` get their arguments passed through untouched
 - **Global root flag** — with `RootFlag: "R"`, the forms `-R <value>` / `-R=<value>` / `--R=<value>` are accepted at *any* position — including before the verb name — stripped before verb flag parsing, and delivered via `Environment.Root`. Stripping stops at a `--` terminator
+- **Global bool root flags** — `RootBoolFlags: []string{"json"}` declares valueless global flags (`-json`/`--json`, plus `=true`/`=false` forms) stripped anywhere and delivered via `Environment.RootBools`
+- **`UsageError`** — a verb's argument-validation failures exit `2` with its usage line appended (detected through `%w` wrapping and nested dispatch); the default `FlagError` mapping uses it too
 - **Help everywhere** — `help` prints the command list, `help <verb>` prints that verb's `Usage()` line plus its flag defaults, and `-h`/`-help` works at the top level and per verb — all to stdout with exit code `0` (`ErrHelp` for hook-level consumers)
 - **Nested subcommands** — an inner `App` reuses the same dispatch machinery through `Dispatch` / `SubDispatch`
 - **Assembly-time product voice** — `FlagError`, `RenderError`, and help composition (`HelpHeader` / `VerbTitle` / `HelpFooter`) are injectable; the framework ships no opinionated copy
-- **Exit-code convention** — `0` success, `1` command error, `2` usage error (unknown verb)
+- **Exit-code convention** — `0` success, `1` command error, `2` usage error (unknown verb, flag parse failure, verb-declared `UsageError`)
 
 ## Installation
 
@@ -106,9 +108,10 @@ The execution environment of one command (injectable for tests):
 
 ```go
 type Environment struct {
-	Stdout io.Writer
-	Stderr io.Writer
-	Root   string // value of the global root flag; empty = not provided
+	Stdout    io.Writer
+	Stderr    io.Writer
+	Root      string           // value of the global root flag; empty = not provided
+	RootBools map[string]bool  // parsed values of the global bool root flags
 }
 ```
 
@@ -116,6 +119,12 @@ type Environment struct {
 `"R"`). The framework extracts it but does not interpret it — its meaning
 (repository root, workspace root, …) is defined by the verb. If the flag
 is absent, a programmatically pre-set `Root` is preserved.
+
+`RootBools` holds the parsed values of the global bool root flags
+(`App.RootBoolFlags`, e.g. `[]string{"json"}`). A key is present only
+when the flag was provided; read it as `env.RootBools["json"]` (a
+missing key reads as `false`). Preset values are preserved, and parsing
+never mutates a caller-supplied map.
 
 ### `Command` and `Flagged`
 
@@ -194,6 +203,48 @@ Details:
 - A dangling `-R` with no following token counts as *not provided* (empty
   `Root`) and is left to the verb's own usage validation to report.
 
+### Bool root flags
+
+`RootBoolFlags: []string{"json"}` declares valueless global bool flags,
+stripped wherever they appear (verb position included) and landing in
+`Environment.RootBools`:
+
+```console
+mytool --json verify .
+mytool verify --json .
+mytool verify --json=false .   # explicit false
+```
+
+Details:
+
+- An `=value` form is honored when the value parses as a boolean
+  (`strconv.ParseBool`); anything else (e.g. `--json=yes`) stays in place
+  for verb-level parsing to reject.
+- Last occurrence wins per flag; a `--` terminator ends stripping.
+- `Run` panics on duplicate names or a collision with `RootFlag` —
+  assembly-time bugs, like `Register`'s panics.
+
+### `UsageError`
+
+A verb flags its own argument-validation failures as usage problems —
+rendered like any error, with the verb's usage line appended, and mapped
+to exit code `2` (instead of `1`):
+
+```go
+func (c *configCmd) Run(_ context.Context, _ *commands.Environment, args []string) error {
+	if c.path == "" {
+		return &commands.UsageError{Usage: c.Usage(), Err: errors.New("config: --config is required")}
+	}
+	// ...
+}
+```
+
+The error is detected through `fmt.Errorf("%w")` wrapping and across
+nested `SubDispatch`. Since v0.2.0 the default `FlagError` mapping also
+returns a `UsageError`, so a flag parse failure exits `2` with the verb's
+usage hint (custom `FlagError` hooks keep full control — whatever error
+they return decides the exit path).
+
 ### Help and `-h`
 
 | Invocation | Output | Exit |
@@ -248,11 +299,13 @@ layer — so the outer help screen is not appended.
 |---|---|---|
 | `0` | `ExitOK` | Success (also: no arguments / `help` / `help <verb>` / `-h`) |
 | `1` | `ExitError` | Verb returned an error (incl. unknown nested subcommand) |
-| `2` | `ExitUsage` | Unknown verb at this layer; help appended to stderr |
+| `2` | `ExitUsage` | Usage error: unknown verb at this layer (help appended), a flag parse failure (usage line appended, since v0.2.0), or a verb-declared `UsageError` (usage hint appended) |
 
 `UnknownVerbError{Name}` is the error shape for a dispatch miss;
 `App.Run` selects exit code `2` and appends help based on it, and its
-message can be rewritten through `RenderError`.
+message can be rewritten through `RenderError`. `UsageError{Usage, Err}`
+carries the same treatment for verb-level argument problems — see
+[`UsageError`](#usageerror).
 
 ## Testing
 
@@ -280,7 +333,8 @@ quick-start smoke test.
 [English](#commands)
 
 一个零依赖的 Go 子命令 CLI 框架库：动词注册与分发、声明式旗标解析、
-任意位置可用的全局根旗标、嵌套子动词、各级 help（`help`、
+任意位置可用的全局根旗标（值形式 + 无值 bool 形式）、动词级用法错误
+（`UsageError` → 退出码 2 + usage 提示）、嵌套子动词、各级 help（`help`、
 `help <动词>`、`-h`），以及 `0/1/2` 退出码约定——全部基于标准库实现。
 
 ## 特性
@@ -288,10 +342,12 @@ quick-start smoke test.
 - **零依赖** —— 纯标准库（`context`、`errors`、`flag`、`fmt`、`io`、`sort`、`strings`）
 - **声明式旗标** —— 动词实现 `Flagged.SetFlags` 即可；FlagSet 构造与解析错误映射由 App 单点承担，flag 包自身的诊断输出被静默，解析失败只经 `FlagError` 钩子渲染为 stderr 上的**单行**错误。未实现 `Flagged` 的动词参数原样透传
 - **全局根旗标** —— 置 `RootFlag: "R"` 后，`-R <值>` / `-R=<值>` / `--R=<值>` 在**任意位置**（含动词名之前）都被剥离（先于动词旗标解析），值经 `Environment.Root` 送达；遇到 `--` 终结符即停止剥离
+- **全局 bool 根旗标** —— `RootBoolFlags: []string{"json"}` 声明无值全局旗标（`-json`/`--json`，支持 `=true`/`=false`），任意位置剥离，值经 `Environment.RootBools` 送达
+- **`UsageError`** —— 动词的参数校验失败退出码为 `2` 并附 usage 提示行（可穿透 `%w` 包装与嵌套分发）；v0.2.0 起默认 `FlagError` 映射同样走 `UsageError`
 - **各级 help** —— `help` 打命令列表，`help <动词>` 打该动词的 `Usage()` 行与旗标缺省值，`-h`/`-help` 在顶层与动词级都可用——全部输出到 stdout、退出码 `0`（钩子层消费者会收到 `ErrHelp`）
 - **嵌套子动词** —— 内层 `App` 通过 `Dispatch` / `SubDispatch` 复用同一套分发机器
 - **装配期注入产品口径** —— `FlagError`、`RenderError` 与帮助面组装（`HelpHeader` / `VerbTitle` / `HelpFooter`）均可注入，框架不带自己的文案
-- **退出码约定** —— `0` 成功；`1` 命令错误；`2` 用法错误（未知动词）
+- **退出码约定** —— `0` 成功；`1` 命令错误；`2` 用法错误（未知动词 / 旗标解析失败 / 动词声明的 `UsageError`）
 
 ## 安装
 

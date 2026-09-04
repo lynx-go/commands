@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -209,16 +210,18 @@ func TestUnknownVerbIsUsageErrorWithHelp(t *testing.T) {
 }
 
 func TestFlagErrorRendersSingleLine(t *testing.T) {
-	// The flag package's own diagnostics are silenced; the mapped
-	// FlagError line is the single rendering point on stderr.
+	// The flag package's own diagnostics are silenced; the mapped FlagError
+	// line is the single rendering point on stderr. Since v0.2.0 the
+	// default mapping is a UsageError: the verb's usage line is appended
+	// and the exit code is 2 (a parse failure is a usage problem).
 	app := newTestApp()
 	var out, errOut bytes.Buffer
 	env := &Environment{Stdout: &out, Stderr: &errOut}
 	code := app.Run(context.Background(), env, []string{"echo", "--bogus"})
-	if code != ExitError {
-		t.Fatalf("exit code = %d, want 1", code)
+	if code != ExitUsage {
+		t.Fatalf("exit code = %d, want 2", code)
 	}
-	want := "echo: bad arguments: flag provided but not defined: -bogus\n"
+	want := "echo: bad arguments: flag provided but not defined: -bogus\nusage: echo [-upper] words...\n"
 	if errOut.String() != want {
 		t.Fatalf("stderr = %q, want exactly %q", errOut.String(), want)
 	}
@@ -424,6 +427,166 @@ func TestNestedSubcommands(t *testing.T) {
 	}
 	if err := subs.SubDispatch(context.Background(), env, []string{"nope"}); err == nil || err.Error() != `unknown subcommand "nope"` {
 		t.Fatalf("SubDispatch error = %v, want unknown subcommand %q", err, "nope")
+	}
+}
+
+// boolSpy records the RootBools and positionals seen by Run.
+type boolSpy struct {
+	booleans map[string]bool
+	pos      *string
+}
+
+func (boolSpy) Name() string     { return "spy" }
+func (boolSpy) Synopsis() string { return "record bools" }
+func (boolSpy) Usage() string    { return "spy" }
+
+func (b boolSpy) Run(_ context.Context, env *Environment, args []string) error {
+	b.booleans["snapshot"] = env.RootBools["json"]
+	*b.pos = strings.Join(args, " ")
+	return nil
+}
+
+func TestRootBoolFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantJSON bool
+		wantSet  bool // whether RootBools has the key at all
+		wantPos  string
+	}{
+		{"before verb", []string{"--json", "spy", "a"}, true, true, "a"},
+		{"after verb", []string{"spy", "--json", "a"}, true, true, "a"},
+		{"short form", []string{"spy", "-json", "a"}, true, true, "a"},
+		{"explicit true", []string{"spy", "--json=true", "a"}, true, true, "a"},
+		{"explicit false", []string{"spy", "--json=false", "a"}, false, true, "a"},
+		{"last wins", []string{"spy", "--json=false", "--json", "a"}, true, true, "a"},
+		{"absent", []string{"spy", "a"}, false, false, "a"},
+		{"unparsable value passes through", []string{"spy", "--json=yes", "a"}, false, false, "--json=yes|a"},
+		{"terminator is literal", []string{"spy", "a", "--", "--json"}, false, false, "a|--|--json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			saw := map[string]bool{}
+			pos := ""
+			app := New()
+			app.RootBoolFlags = []string{"json"}
+			app.Register(boolSpy{booleans: saw, pos: &pos})
+			var out bytes.Buffer
+			code := app.Run(context.Background(), &Environment{Stdout: &out, Stderr: &out}, tc.args)
+			if code != ExitOK {
+				t.Fatalf("exit code = %d, want 0", code)
+			}
+			if saw["snapshot"] != tc.wantJSON {
+				t.Fatalf("RootBools[json] = %v, want %v", saw["snapshot"], tc.wantJSON)
+			}
+			if tc.wantPos != "" && strings.Join(strings.Fields(pos), "|") != tc.wantPos {
+				t.Fatalf("positionals = %q, want %q", pos, tc.wantPos)
+			}
+		})
+	}
+}
+
+func TestRootBoolFlagsMergeWithPreset(t *testing.T) {
+	// A caller may pre-set RootBools programmatically; absent flags must
+	// not clobber it, and a provided flag must not mutate the caller's map.
+	preset := map[string]bool{"verbose": true}
+	saw := map[string]bool{}
+	pos := ""
+	app := New()
+	app.RootBoolFlags = []string{"json"}
+	app.Register(boolSpy{booleans: saw, pos: &pos})
+	var out bytes.Buffer
+	code := app.Run(context.Background(), &Environment{Stdout: &out, Stderr: &out, RootBools: preset}, []string{"spy", "--json"})
+	if code != ExitOK {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !preset["verbose"] || len(preset) != 1 {
+		t.Fatalf("caller's RootBools mutated: %v", preset)
+	}
+}
+
+func TestRootConfigValidationPanics(t *testing.T) {
+	app := New()
+	app.RootBoolFlags = []string{"json", "json"}
+	mustPanic(t, "duplicate root flag", func() {
+		app.Run(context.Background(), &Environment{}, []string{"spy"})
+	})
+	app2 := New()
+	app2.RootFlag = "json"
+	app2.RootBoolFlags = []string{"json"}
+	mustPanic(t, "duplicate root flag", func() {
+		app2.Run(context.Background(), &Environment{}, []string{"spy"})
+	})
+}
+
+// usageCmd returns a UsageError, optionally wrapped the way real verbs
+// report through layers (fmt.Errorf("%w")) and optionally without a usage
+// hint.
+type usageCmd struct {
+	hint bool // include the usage hint
+	wrap bool // wrap in fmt.Errorf("%w") before returning
+}
+
+func (usageCmd) Name() string     { return "fussy" }
+func (usageCmd) Synopsis() string { return "validates its arguments" }
+func (usageCmd) Usage() string    { return "fussy --config FILE" }
+func (u usageCmd) Run(_ context.Context, _ *Environment, _ []string) error {
+	err := error(&UsageError{Err: errors.New("fussy: --config is required")})
+	if u.hint {
+		err = &UsageError{Usage: "fussy --config FILE", Err: errors.New("fussy: --config is required")}
+	}
+	if u.wrap {
+		return fmt.Errorf("while running: %w", err)
+	}
+	return err
+}
+
+func TestUsageErrorExitsTwoWithHint(t *testing.T) {
+	app := newTestApp()
+	app.Register(usageCmd{hint: true})
+	var out, errOut bytes.Buffer
+	env := &Environment{Stdout: &out, Stderr: &errOut}
+	code := app.Run(context.Background(), env, []string{"fussy"})
+	if code != ExitUsage {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	want := "fussy: --config is required\nusage: fussy --config FILE\n"
+	if errOut.String() != want {
+		t.Fatalf("stderr = %q, want exactly %q", errOut.String(), want)
+	}
+}
+
+func TestUsageErrorWrappedAndEmptyVerb(t *testing.T) {
+	app := newTestApp()
+	app.Register(usageCmd{wrap: true})
+	var out, errOut bytes.Buffer
+	env := &Environment{Stdout: &out, Stderr: &errOut}
+	// Wrap the verb error the way real verbs do (fmt.Errorf("%w")): the
+	// UsageError must still be detected through the chain; the empty Verb
+	// means exit 2 without a usage hint.
+	code := app.Run(context.Background(), env, []string{"fussy"})
+	if code != ExitUsage {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	if errOut.String() != "while running: fussy: --config is required\n" {
+		t.Fatalf("stderr = %q, want the wrapped error without a hint", errOut.String())
+	}
+}
+
+func TestUsageErrorCrossesNesting(t *testing.T) {
+	// An inner verb's UsageError passes through SubDispatch untouched: the
+	// outer Run still exits 2 with the verb's usage hint.
+	subs := New()
+	subs.Register(usageCmd{hint: true})
+	app := New()
+	app.RootFlag = "R"
+	app.Register(&parentCmd{subs: subs})
+	var out, errOut bytes.Buffer
+	code := app.Run(context.Background(), &Environment{Stdout: &out, Stderr: &errOut}, []string{"parent", "fussy"})
+	if code != ExitUsage {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), "usage: fussy --config FILE") {
+		t.Fatalf("stderr = %q, want the inner verb's usage hint", errOut.String())
 	}
 }
 

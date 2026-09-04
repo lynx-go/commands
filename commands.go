@@ -1,9 +1,11 @@
 // Package commands is a small, zero-dependency framework for building
 // subcommand-style CLIs: verb registration and dispatch, declarative flag
-// parsing (Flagged/SetFlags), nested subcommand reuse (Dispatch), a
-// configurable global root flag, and hooks for error rendering. It uses
-// only the standard library — error copy, help text, and the root-flag
-// name are product decisions injected by the consumer at assembly time.
+// parsing (Flagged/SetFlags), nested subcommand reuse (Dispatch),
+// configurable global root flags (a value-carrying RootFlag plus optional
+// valueless bool RootBoolFlags), verb-declared usage errors (UsageError →
+// exit 2 with a usage hint), and hooks for error rendering. It uses only
+// the standard library — error copy, help text, and the root-flag names
+// are product decisions injected by the consumer at assembly time.
 package commands
 
 import (
@@ -13,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -20,11 +23,18 @@ import (
 // tests). Root is the landing spot of the global root flag (App.RootFlag,
 // e.g. "R") — the framework extracts it without interpreting it; its
 // meaning (repository root, workspace root, …) is defined by the verb.
-// Empty means "not provided".
+// Empty means "not provided". RootBools holds the parsed values of the
+// global bool root flags (App.RootBoolFlags, e.g. "json"): a key is
+// present only when the flag was provided; read it as env.RootBools[name]
+// (a missing key reads as false).
 type Environment struct {
 	Stdout io.Writer
 	Stderr io.Writer
 	Root   string
+
+	// RootBools is nil until a bool root flag is provided (or a caller
+	// pre-sets it programmatically; Dispatch preserves preset values).
+	RootBools map[string]bool
 }
 
 // Command is the verb contract. The error returned by Run is rendered to
@@ -48,7 +58,7 @@ type Flagged interface {
 }
 
 // Exit-code convention: 0 success; 1 command error; 2 usage error
-// (unknown verb).
+// (unknown verb, flag parse failure, or a verb-declared UsageError).
 const (
 	ExitOK    = 0
 	ExitError = 1
@@ -68,6 +78,22 @@ type UnknownVerbError struct{ Name string }
 
 func (e *UnknownVerbError) Error() string { return fmt.Sprintf("unknown verb %q", e.Name) }
 
+// UsageError marks a verb-level usage problem — a missing required flag, a
+// bad positional — as distinct from a command failure: App.Run renders it
+// to stderr like any error and, when Usage is non-empty, appends it as a
+// "usage:" hint line, then exits with ExitUsage (2). Carrying the usage
+// string (not a verb name) keeps the hint intact across nested dispatch —
+// the verb knows its own Usage() at construction. Wrap it (or return it
+// directly) from Run for argument-validation failures; a non-nil Err is
+// required. Usage may be empty to exit 2 without a hint.
+type UsageError struct {
+	Usage string
+	Err   error
+}
+
+func (e *UsageError) Error() string { return e.Err.Error() }
+func (e *UsageError) Unwrap() error { return e.Err }
+
 // App holds the registered verbs. The zero value is usable; New
 // additionally sets the default verb title.
 type App struct {
@@ -79,6 +105,16 @@ type App struct {
 	// inner apps should leave it empty — the outer layer already stripped
 	// it.
 	RootFlag string
+
+	// RootBoolFlags are global valueless bool flags ("json" ⇒ matches
+	// -json/--json anywhere, landing in Environment.RootBools["json"];
+	// -json=false/--json=false also parse and set false). Like RootFlag
+	// they are stripped wherever they appear, last occurrence wins, and a
+	// "--" terminator ends stripping; an =value that does not parse as a
+	// boolean is left in place for verb-level parsing. Nested inner apps
+	// should leave it empty. Run panics on a duplicate entry or a collision
+	// with RootFlag — both are assembly-time bugs.
+	RootBoolFlags []string
 
 	// FlagError maps a flag parse failure to a business error. Default
 	// "%s: bad arguments: %v".
@@ -154,12 +190,9 @@ func (a *App) Names() []string {
 // -h (parsed in ParseFlags) has already printed the verb's help to
 // stdout; Run maps ErrHelp to ExitOK without rendering.
 func (a *App) Run(ctx context.Context, env *Environment, args []string) int {
+	a.validateRoot()
 	e := *env
-	if a.RootFlag != "" {
-		if stripped, root, found := extractRootFlag(a.RootFlag, args); found {
-			args, e.Root = stripped, root
-		}
-	}
+	args, e = a.stripRootEnv(args, e)
 	if len(args) == 0 || isHelpFlag(args[0]) {
 		a.printHelp(e.Stdout)
 		return ExitOK
@@ -188,6 +221,13 @@ func (a *App) Run(ctx context.Context, env *Environment, args []string) int {
 		a.printHelp(e.Stderr)
 		return ExitUsage
 	}
+	var usage *UsageError
+	if errors.As(err, &usage) {
+		if usage.Usage != "" {
+			fmt.Fprintln(e.Stderr, "usage:", usage.Usage)
+		}
+		return ExitUsage
+	}
 	return ExitError
 }
 
@@ -208,11 +248,7 @@ func (a *App) Dispatch(ctx context.Context, env *Environment, args []string) err
 	}
 	rest := args[1:]
 	e := *env
-	if a.RootFlag != "" {
-		if stripped, root, found := extractRootFlag(a.RootFlag, rest); found {
-			rest, e.Root = stripped, root
-		}
-	}
+	rest, e = a.stripRootEnv(rest, e)
 	rest, err := a.ParseFlags(cmd, &e, rest)
 	if err != nil {
 		return err
@@ -255,16 +291,19 @@ func (a *App) ParseFlags(cmd Command, env *Environment, rest []string) ([]string
 		return nil, ErrHelp
 	}
 	if err != nil {
-		return nil, a.flagError(cmd.Name(), err)
+		return nil, a.flagError(cmd, err)
 	}
 	return fs.Args(), nil
 }
 
-func (a *App) flagError(verb string, err error) error {
+func (a *App) flagError(cmd Command, err error) error {
 	if a.FlagError != nil {
-		return a.FlagError(verb, err)
+		return a.FlagError(cmd.Name(), err)
 	}
-	return fmt.Errorf("%s: bad arguments: %v", verb, err)
+	return &UsageError{
+		Usage: cmd.Usage(),
+		Err:   fmt.Errorf("%s: bad arguments: %v", cmd.Name(), err),
+	}
 }
 
 func (a *App) render(err error) string {
@@ -274,33 +313,111 @@ func (a *App) render(err error) string {
 	return err.Error()
 }
 
-// extractRootFlag removes the global root flag (-X value / -X=value /
-// --X=value) from the argument list, returning the remaining arguments
-// and the value; found reports whether any form was present. A dangling
-// -X with no following token counts as provided-but-empty and is left to
-// the verb's own usage validation. Stripping stops at a "--" terminator:
-// everything after it is literal.
-func extractRootFlag(name string, args []string) (rest []string, value string, found bool) {
-	short, long := "-"+name, "--"+name
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "--" {
-			return args, "", false
-		}
-		if a == short || a == long {
-			if i+1 >= len(args) {
-				return args[:i:i], "", true
-			}
-			return append(args[:i:i], args[i+2:]...), args[i+1], true
-		}
-		if v, ok := strings.CutPrefix(a, short+"="); ok {
-			return append(args[:i:i], args[i+1:]...), v, true
-		}
-		if v, ok := strings.CutPrefix(a, long+"="); ok {
-			return append(args[:i:i], args[i+1:]...), v, true
-		}
+// validateRoot fails fast on root-flag configuration bugs: an empty or
+// duplicate bool root-flag name, or a name colliding with RootFlag. Run
+// calls it once at the top level, mirroring Register's assembly-time
+// panics.
+func (a *App) validateRoot() {
+	seen := map[string]bool{}
+	if a.RootFlag != "" {
+		seen[a.RootFlag] = true
 	}
-	return args, "", false
+	for _, n := range a.RootBoolFlags {
+		if n == "" {
+			panic("commands: empty root bool flag name")
+		}
+		if seen[n] {
+			panic(fmt.Sprintf("commands: duplicate root flag %q", n))
+		}
+		seen[n] = true
+	}
+}
+
+// stripRootEnv strips the configured root flags (RootFlag's value form and
+// RootBoolFlags' bool forms) from args in one pass, writing the parsed
+// values into a copy of env and returning the remaining arguments with it.
+func (a *App) stripRootEnv(args []string, e Environment) ([]string, Environment) {
+	if a.RootFlag == "" && len(a.RootBoolFlags) == 0 {
+		return args, e
+	}
+	bools := map[string]bool{}
+	for _, n := range a.RootBoolFlags {
+		bools[n] = false
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		tok := args[i]
+		if tok == "--" {
+			return append(out, args[i:]...), e
+		}
+		if name, val, ok := splitFlag(tok); ok {
+			if _, isBool := bools[name]; isBool {
+				if val == "" {
+					e.RootBools = setBool(e.RootBools, name, true)
+					continue
+				}
+				if b, err := strconv.ParseBool(val); err == nil {
+					e.RootBools = setBool(e.RootBools, name, b)
+					continue
+				}
+				// An =value that does not parse as a boolean stays in
+				// place: verb-level parsing owns the error message.
+				out = append(out, tok)
+				continue
+			}
+		}
+		if a.RootFlag != "" {
+			short, long := "-"+a.RootFlag, "--"+a.RootFlag
+			if tok == short || tok == long {
+				if i+1 >= len(args) {
+					// Dangling: counts as provided-but-empty and stops the
+					// scan (same as v0.1.0), leaving validation to the verb.
+					e.Root = ""
+					return out, e
+				}
+				i++
+				e.Root = args[i]
+				continue
+			}
+			if v, ok := strings.CutPrefix(tok, short+"="); ok {
+				e.Root = v
+				continue
+			}
+			if v, ok := strings.CutPrefix(tok, long+"="); ok {
+				e.Root = v
+				continue
+			}
+		}
+		out = append(out, tok)
+	}
+	return out, e
+}
+
+// setBool returns an updated RootBools map without mutating the incoming
+// one (a preset Environment belongs to the caller).
+func setBool(booleans map[string]bool, name string, value bool) map[string]bool {
+	out := make(map[string]bool, len(booleans)+1)
+	for k, v := range booleans {
+		out[k] = v
+	}
+	out[name] = value
+	return out
+}
+
+// splitFlag splits a "-name" / "--name" token (optionally with an "=value"
+// suffix) into its name and value.
+func splitFlag(tok string) (name, value string, ok bool) {
+	s := tok
+	switch {
+	case strings.HasPrefix(s, "--"):
+		s = s[2:]
+	case strings.HasPrefix(s, "-"):
+		s = s[1:]
+	default:
+		return "", "", false
+	}
+	name, value, _ = strings.Cut(s, "=")
+	return name, value, true
 }
 
 // isHelpFlag reports whether arg is one of the conventional help flags
