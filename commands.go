@@ -1,7 +1,9 @@
-// Package commands 是通用子命令 CLI 框架：动词注册/分发、声明式旗标解析
-// （Flagged/SetFlags）、嵌套子动词复用（Dispatch）、可配置全局根旗标与错误
-// 渲染钩子。零业务依赖（纯标准库）——错误包络形态、帮助文案、根旗标名等
-// 产品语义由消费方在装配期注入。
+// Package commands is a small, zero-dependency framework for building
+// subcommand-style CLIs: verb registration and dispatch, declarative flag
+// parsing (Flagged/SetFlags), nested subcommand reuse (Dispatch), a
+// configurable global root flag, and hooks for error rendering. It uses
+// only the standard library — error copy, help text, and the root-flag
+// name are product decisions injected by the consumer at assembly time.
 package commands
 
 import (
@@ -14,17 +16,20 @@ import (
 	"strings"
 )
 
-// Environment 是一次命令执行的运行环境（测试可注入）。Root 是全局根旗标
-// （App.RootFlag，如 "R"）的落点——框架只摘取不解释，语义（仓库根/工作区
-// 根）由动词定义；空 = 未提供。
+// Environment is the execution environment of one command (injectable in
+// tests). Root is the landing spot of the global root flag (App.RootFlag,
+// e.g. "R") — the framework extracts it without interpreting it; its
+// meaning (repository root, workspace root, …) is defined by the verb.
+// Empty means "not provided".
 type Environment struct {
 	Stdout io.Writer
 	Stderr io.Writer
 	Root   string
 }
 
-// Command 是子动词契约。Run 返回的 error 由 App.Run 经 RenderError 渲染到
-// stderr 并以退出码 1 结束（渲染与退出策略可经钩子定制）。
+// Command is the verb contract. The error returned by Run is rendered to
+// stderr by App.Run via RenderError and ends the process with exit code 1
+// (both the rendering and the exit policy are hook-customizable).
 type Command interface {
 	Name() string
 	Synopsis() string
@@ -32,48 +37,65 @@ type Command interface {
 	Run(ctx context.Context, env *Environment, args []string) error
 }
 
-// Flagged 由带旗标的动词实现：SetFlags 声明式注册旗标（指针存动词结构体
-// 字段，Run 读字段），FlagSet 构造与 Parse 错误映射由 App 单点承担——消息
-// 形态不再靠每动词样板复制。未实现者参数原样透传（无旗主动词忽略未知参数
-// 的语义不动）。
+// Flagged is implemented by verbs that take flags: SetFlags declares them
+// (pointers stored in the verb struct, fields read inside Run); FlagSet
+// construction and parse-error mapping are owned by App in one place, so
+// the message shape is not copy-pasted per verb. Verbs that do not
+// implement Flagged get their arguments passed through untouched (bare
+// verbs keep their ignore-unknown-arguments semantics).
 type Flagged interface {
 	SetFlags(fs *flag.FlagSet)
 }
 
-// 退出码约定：0 成功；1 命令错误；2 用法错误（未知动词）。
+// Exit-code convention: 0 success; 1 command error; 2 usage error
+// (unknown verb).
 const (
 	ExitOK    = 0
 	ExitError = 1
 	ExitUsage = 2
 )
 
-// UnknownVerbError 是分发未命中动词（含嵌套子动词）的错误形态。App.Run
-// 据此选用法退出码并附帮助面；文案经 RenderError 钩子可重写（产品口径）。
+// ErrHelp reports that help output has already been written to
+// Environment.Stdout: a verb-level -h/-help was parsed in App.ParseFlags.
+// App.Run maps it to ExitOK without rendering; consumers driving Dispatch
+// directly should treat it as success.
+var ErrHelp = errors.New("help requested")
+
+// UnknownVerbError is the error shape of a dispatch miss. App.Run uses it
+// to pick the usage exit code and append the help screen; its message can
+// be rewritten through the RenderError hook (product voice).
 type UnknownVerbError struct{ Name string }
 
 func (e *UnknownVerbError) Error() string { return fmt.Sprintf("unknown verb %q", e.Name) }
 
-// App 持有已注册动词。零值可用；New 给出缺省钩子形态。
+// App holds the registered verbs. The zero value is usable; New
+// additionally sets the default verb title.
 type App struct {
 	commands map[string]Command
 
-	// RootFlag 是全局根旗标名（"R" ⇒ 匹配 -R/--R/-R=/--R=，任意位置预剥离，
-	// 值落 Environment.Root）。空 = 不剥离。嵌套子动词表应置空——外层已剥离。
+	// RootFlag is the global root-flag name ("R" ⇒ matches -R/--R/-R=/--R=,
+	// stripped wherever it appears — including before the verb name — with
+	// the value landing in Environment.Root). Empty = no stripping. Nested
+	// inner apps should leave it empty — the outer layer already stripped
+	// it.
 	RootFlag string
 
-	// FlagError 把旗标解析失败映射为业务错误。缺省 "%s: 参数错误: %v"。
+	// FlagError maps a flag parse failure to a business error. Default
+	// "%s: bad arguments: %v".
 	FlagError func(verb string, err error) error
 
-	// RenderError 把动词错误渲染为 stderr 单行文案。缺省 err.Error()。
+	// RenderError renders a verb error as a single stderr line. Default
+	// err.Error().
 	RenderError func(error) string
 
-	// HelpHeader / VerbTitle / HelpFooter 组装帮助面（printHelp）。
+	// HelpHeader / VerbTitle / HelpFooter compose the help screen
+	// (printHelp).
 	HelpHeader string
 	VerbTitle  string
 	HelpFooter string
 }
 
-// New 建空表框架实例（动词标题缺省 "commands:"）。
+// New returns an empty app (verb title defaults to "commands:").
 func New() *App {
 	return &App{
 		commands:  map[string]Command{},
@@ -81,21 +103,34 @@ func New() *App {
 	}
 }
 
+// Register adds verbs to the dispatch table. It panics on a verb named
+// "help" (reserved for the built-in help screen) or on a duplicate name —
+// both are assembly-time bugs best caught immediately, in the spirit of
+// regexp.MustCompile.
 func (a *App) Register(cmds ...Command) {
 	if a.commands == nil {
 		a.commands = map[string]Command{}
 	}
 	for _, c := range cmds {
-		a.commands[c.Name()] = c
+		name := c.Name()
+		if name == "help" {
+			panic(fmt.Sprintf("commands: verb name %q is reserved", name))
+		}
+		if _, dup := a.commands[name]; dup {
+			panic(fmt.Sprintf("commands: duplicate verb %q", name))
+		}
+		a.commands[name] = c
 	}
 }
 
+// Lookup finds a verb by name.
 func (a *App) Lookup(name string) (Command, bool) {
 	c, ok := a.commands[name]
 	return c, ok
 }
 
-// Names 返回全部动词名（字典序——帮助面顺序与注册序无关）。
+// Names returns all verb names sorted alphabetically — help-screen order
+// is independent of registration order.
 func (a *App) Names() []string {
 	names := make([]string, 0, len(a.commands))
 	for n := range a.commands {
@@ -105,41 +140,78 @@ func (a *App) Names() []string {
 	return names
 }
 
-// Run 是进程顶层入口：空参数/help 打帮助返回 0；未知动词渲染错误并附帮助
-// 面、退出码 2；其余错误渲染后退出码 1。
+// Run is the process top-level entry; it returns the exit code:
+//
+//   - no arguments, "help", or a -h/-help flag prints the help screen to
+//     stdout and returns ExitOK; "help <verb>" prints that verb's usage
+//     and flag defaults to stdout and returns ExitOK
+//   - an unknown verb (or "help <unknown>") renders the error, appends
+//     the help screen to stderr, and returns ExitUsage
+//   - any other verb error is rendered to stderr and returns ExitError
+//
+// If RootFlag is set, its forms are stripped from the full argument list
+// first, so the root flag may also precede the verb name. A verb-level
+// -h (parsed in ParseFlags) has already printed the verb's help to
+// stdout; Run maps ErrHelp to ExitOK without rendering.
 func (a *App) Run(ctx context.Context, env *Environment, args []string) int {
-	if len(args) == 0 || args[0] == "help" {
-		a.printHelp(env.Stdout)
+	e := *env
+	if a.RootFlag != "" {
+		if stripped, root, found := extractRootFlag(a.RootFlag, args); found {
+			args, e.Root = stripped, root
+		}
+	}
+	if len(args) == 0 || isHelpFlag(args[0]) {
+		a.printHelp(e.Stdout)
 		return ExitOK
 	}
-	err := a.Dispatch(ctx, env, args)
-	if err == nil {
+	if args[0] == "help" {
+		if len(args) > 1 {
+			cmd, ok := a.Lookup(args[1])
+			if !ok {
+				fmt.Fprintln(e.Stderr, a.render(&UnknownVerbError{Name: args[1]}))
+				a.printHelp(e.Stderr)
+				return ExitUsage
+			}
+			a.printVerbHelp(e.Stdout, cmd)
+			return ExitOK
+		}
+		a.printHelp(e.Stdout)
 		return ExitOK
 	}
-	fmt.Fprintln(env.Stderr, a.render(err))
+	err := a.Dispatch(ctx, &e, args)
+	if err == nil || errors.Is(err, ErrHelp) {
+		return ExitOK
+	}
+	fmt.Fprintln(e.Stderr, a.render(err))
 	var unknown *UnknownVerbError
 	if errors.As(err, &unknown) {
-		a.printHelp(env.Stderr)
+		a.printHelp(e.Stderr)
 		return ExitUsage
 	}
 	return ExitError
 }
 
-// Dispatch 分发一个动词并返回其错误（不渲染、不涉及退出码）——嵌套子动词
-// 表复用同一机器：外层动词的 Run 把剩余参数交给内层 App.Dispatch 即获得
-// 同构的未知子动词报错与旗标解析。args 至少一个元素（空参由外层 Run 或
-// 外层动词自行处置）。
+// Dispatch dispatches one verb and returns its error (no rendering, no
+// exit code) — nested subcommand tables reuse the same machinery: an
+// outer verb's Run hands its remaining arguments to an inner App.Dispatch
+// and gets the same unknown-verb error shape and flag parsing. args must
+// contain at least one element (empty input is handled by the outer Run
+// or the outer verb itself).
+//
+// When RootFlag is set but no root flag is present in args, an incoming
+// Environment.Root is preserved (a caller may set it programmatically);
+// if the flag appears more than once, the last occurrence wins.
 func (a *App) Dispatch(ctx context.Context, env *Environment, args []string) error {
 	cmd, ok := a.commands[args[0]]
 	if !ok {
 		return &UnknownVerbError{Name: args[0]}
 	}
 	rest := args[1:]
-	// 全局根旗标预剥离（-X 值 / -X=值 / --X=值，任意位置）——派生 Environment
-	// 分发（不改动调用方传入的 env）。
 	e := *env
 	if a.RootFlag != "" {
-		rest, e.Root = extractRootFlag(a.RootFlag, rest)
+		if stripped, root, found := extractRootFlag(a.RootFlag, rest); found {
+			rest, e.Root = stripped, root
+		}
 	}
 	rest, err := a.ParseFlags(cmd, &e, rest)
 	if err != nil {
@@ -148,9 +220,10 @@ func (a *App) Dispatch(ctx context.Context, env *Environment, args []string) err
 	return cmd.Run(ctx, &e, rest)
 }
 
-// SubDispatch 分发嵌套子动词并转写内层 UnknownVerbError——外层 Run 的用法
-// 错误判定（退出码 2 + 帮助面）只认本层动词未命中，子动词未命中是子表内
-// 的命令错误（退出码 1）。
+// SubDispatch dispatches a nested subcommand and rewrites the inner
+// UnknownVerbError — the outer Run's usage-error decision (exit code 2
+// plus help screen) only recognizes a miss at its own level; a subcommand
+// miss is a command error of the inner table (exit code 1).
 func (a *App) SubDispatch(ctx context.Context, env *Environment, args []string) error {
 	err := a.Dispatch(ctx, env, args)
 	var unknown *UnknownVerbError
@@ -160,18 +233,28 @@ func (a *App) SubDispatch(ctx context.Context, env *Environment, args []string) 
 	return err
 }
 
-// ParseFlags 对实现 Flagged 的动词统一执行旗标解析：建 FlagSet → SetFlags
-// 声明注册 → Parse → FlagError 映射。返回 Parse 后的位置参数（fs.Args()）。
-// 与生产分发同构，测试可直接消费。
+// ParseFlags performs unified flag parsing for verbs implementing
+// Flagged: build FlagSet → SetFlags declares → Parse → FlagError maps.
+// It returns the positional arguments left after parsing (fs.Args()).
+// The flag package's own diagnostics are silenced, making FlagError the
+// single rendering point for parse failures. A parsed -h/-help prints
+// the verb's usage to env.Stdout and returns ErrHelp. Identical to
+// production dispatch; tests can consume it directly.
 func (a *App) ParseFlags(cmd Command, env *Environment, rest []string) ([]string, error) {
 	flagged, ok := cmd.(Flagged)
 	if !ok {
 		return rest, nil
 	}
 	fs := flag.NewFlagSet(cmd.Name(), flag.ContinueOnError)
-	fs.SetOutput(env.Stderr)
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 	flagged.SetFlags(fs)
-	if err := fs.Parse(rest); err != nil {
+	err := fs.Parse(rest)
+	if errors.Is(err, flag.ErrHelp) {
+		a.printVerbHelp(env.Stdout, cmd)
+		return nil, ErrHelp
+	}
+	if err != nil {
 		return nil, a.flagError(cmd.Name(), err)
 	}
 	return fs.Args(), nil
@@ -181,7 +264,7 @@ func (a *App) flagError(verb string, err error) error {
 	if a.FlagError != nil {
 		return a.FlagError(verb, err)
 	}
-	return fmt.Errorf("%s: 参数错误: %v", verb, err)
+	return fmt.Errorf("%s: bad arguments: %v", verb, err)
 }
 
 func (a *App) render(err error) string {
@@ -191,27 +274,43 @@ func (a *App) render(err error) string {
 	return err.Error()
 }
 
-// extractRootFlag 摘除参数序列中的全局根旗标（`-X 值` / `-X=值` / `--X=值`），
-// 返回剩余参数与值（未提供 = 空串；`-X` 悬空无值按未提供处理，交由动词的
-// 用法校验报错）。
-func extractRootFlag(name string, args []string) ([]string, string) {
+// extractRootFlag removes the global root flag (-X value / -X=value /
+// --X=value) from the argument list, returning the remaining arguments
+// and the value; found reports whether any form was present. A dangling
+// -X with no following token counts as provided-but-empty and is left to
+// the verb's own usage validation. Stripping stops at a "--" terminator:
+// everything after it is literal.
+func extractRootFlag(name string, args []string) (rest []string, value string, found bool) {
 	short, long := "-"+name, "--"+name
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--" {
+			return args, "", false
+		}
 		if a == short || a == long {
 			if i+1 >= len(args) {
-				return args[:i:i], ""
+				return args[:i:i], "", true
 			}
-			return append(args[:i:i], args[i+2:]...), args[i+1]
+			return append(args[:i:i], args[i+2:]...), args[i+1], true
 		}
 		if v, ok := strings.CutPrefix(a, short+"="); ok {
-			return append(args[:i:i], args[i+1:]...), v
+			return append(args[:i:i], args[i+1:]...), v, true
 		}
 		if v, ok := strings.CutPrefix(a, long+"="); ok {
-			return append(args[:i:i], args[i+1:]...), v
+			return append(args[:i:i], args[i+1:]...), v, true
 		}
 	}
-	return args, ""
+	return args, "", false
+}
+
+// isHelpFlag reports whether arg is one of the conventional help flags
+// accepted wherever a verb name is expected.
+func isHelpFlag(arg string) bool {
+	switch arg {
+	case "-h", "--h", "-help", "--help":
+		return true
+	}
+	return false
 }
 
 func (a *App) printHelp(w io.Writer) {
@@ -231,4 +330,25 @@ func (a *App) printHelp(w io.Writer) {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, a.HelpFooter)
 	}
+}
+
+// printVerbHelp writes one verb's usage line and flag defaults — the help
+// behind "help <verb>" and verb-level -h.
+func (a *App) printVerbHelp(w io.Writer, cmd Command) {
+	fmt.Fprintln(w, "usage:", cmd.Usage())
+	flagged, ok := cmd.(Flagged)
+	if !ok {
+		return
+	}
+	fs := flag.NewFlagSet(cmd.Name(), flag.ContinueOnError)
+	flagged.SetFlags(fs)
+	declared := 0
+	fs.VisitAll(func(*flag.Flag) { declared++ })
+	if declared == 0 {
+		return
+	}
+	fs.SetOutput(w)
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "flags:")
+	fs.PrintDefaults()
 }
