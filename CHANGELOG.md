@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`--json=` (an empty `=value`) stays in place**: the empty value does
+  not parse as a boolean (`strconv.ParseBool("")` fails), so the token
+  is left for verb-level parsing per the documented `=value` contract —
+  it no longer counts as the valueless `-json` form setting `true`.
+
+### Added
+
+- Test coverage pinning the bool root-flag contract: key-presence
+  semantics of `Environment.RootBools` (provided-false vs absent), the
+  empty and unparsable `=value` passthrough at both dispatch positions,
+  a value-form `-R` consuming a following declared bool flag (v0.1.0
+  semantics kept), and the empty-name configuration panic.
+
 ## v0.2.0 (2026-09-04)
 
 Global bool root flags and verb-declared usage errors — both driven by

@@ -111,9 +111,10 @@ type App struct {
 	// -json=false/--json=false also parse and set false). Like RootFlag
 	// they are stripped wherever they appear, last occurrence wins, and a
 	// "--" terminator ends stripping; an =value that does not parse as a
-	// boolean is left in place for verb-level parsing. Nested inner apps
-	// should leave it empty. Run panics on a duplicate entry or a collision
-	// with RootFlag — both are assembly-time bugs.
+	// boolean — including the empty value ("--json=") — is left in place
+	// for verb-level parsing. Nested inner apps should leave it empty.
+	// Run panics on an empty name, a duplicate entry, or a collision with
+	// RootFlag — all assembly-time bugs.
 	RootBoolFlags []string
 
 	// FlagError maps a flag parse failure to a business error. Default
@@ -350,9 +351,10 @@ func (a *App) stripRootEnv(args []string, e Environment) ([]string, Environment)
 		if tok == "--" {
 			return append(out, args[i:]...), e
 		}
-		if name, val, ok := splitFlag(tok); ok {
+		if name, val, hasValue, ok := splitFlag(tok); ok {
 			if _, isBool := bools[name]; isBool {
-				if val == "" {
+				if !hasValue {
+					// Valueless form: -json / --json mean true.
 					e.RootBools = setBool(e.RootBools, name, true)
 					continue
 				}
@@ -360,8 +362,9 @@ func (a *App) stripRootEnv(args []string, e Environment) ([]string, Environment)
 					e.RootBools = setBool(e.RootBools, name, b)
 					continue
 				}
-				// An =value that does not parse as a boolean stays in
-				// place: verb-level parsing owns the error message.
+				// An =value that does not parse as a boolean — including
+				// the empty one ("--json=") — stays in place: verb-level
+				// parsing owns the error message.
 				out = append(out, tok)
 				continue
 			}
@@ -404,9 +407,10 @@ func setBool(booleans map[string]bool, name string, value bool) map[string]bool 
 	return out
 }
 
-// splitFlag splits a "-name" / "--name" token (optionally with an "=value"
-// suffix) into its name and value.
-func splitFlag(tok string) (name, value string, ok bool) {
+// splitFlag splits a "-name" / "--name" token into its name and value;
+// hasValue reports whether an "=value" suffix was present — "-flag=" is a
+// present-but-empty value, distinct from the valueless "-flag".
+func splitFlag(tok string) (name, value string, hasValue, ok bool) {
 	s := tok
 	switch {
 	case strings.HasPrefix(s, "--"):
@@ -414,10 +418,10 @@ func splitFlag(tok string) (name, value string, ok bool) {
 	case strings.HasPrefix(s, "-"):
 		s = s[1:]
 	default:
-		return "", "", false
+		return "", "", false, false
 	}
-	name, value, _ = strings.Cut(s, "=")
-	return name, value, true
+	name, value, hasValue = strings.Cut(s, "=")
+	return name, value, hasValue, true
 }
 
 // isHelpFlag reports whether arg is one of the conventional help flags

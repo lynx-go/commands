@@ -10,7 +10,7 @@ on the standard library.
 
 ## Features
 
-- **Zero dependencies** — pure standard library (`context`, `errors`, `flag`, `fmt`, `io`, `sort`, `strings`)
+- **Zero dependencies** — pure standard library (`context`, `errors`, `flag`, `fmt`, `io`, `sort`, `strconv`, `strings`)
 - **Declarative flags** — verbs implement `Flagged.SetFlags`; the framework owns FlagSet construction and parse-error mapping, and the flag package's own diagnostics are silenced, so a parse failure renders as a *single* stderr line through the `FlagError` hook. Verbs that don't implement `Flagged` get their arguments passed through untouched
 - **Global root flag** — with `RootFlag: "R"`, the forms `-R <value>` / `-R=<value>` / `--R=<value>` are accepted at *any* position — including before the verb name — stripped before verb flag parsing, and delivered via `Environment.Root`. Stripping stops at a `--` terminator
 - **Global bool root flags** — `RootBoolFlags: []string{"json"}` declares valueless global flags (`-json`/`--json`, plus `=true`/`=false` forms) stripped anywhere and delivered via `Environment.RootBools`
@@ -178,6 +178,7 @@ Assembly-time hooks and knobs:
 | Field | Default | Purpose |
 |---|---|---|
 | `RootFlag` | `""` (off) | Global root flag name; `"R"` matches `-R v` / `-R=v` / `--R=v` anywhere, including before the verb name; value lands in `Environment.Root`. Leave empty on nested apps — the outer layer already stripped it |
+| `RootBoolFlags` | `nil` (off) | Global valueless bool flag names; `"json"` matches `-json` / `--json` / `--json=<bool>` anywhere, landing in `Environment.RootBools`. Leave empty on nested apps — the outer layer already stripped them |
 | `FlagError` | `"%s: bad arguments: %v"` | Maps a flag parse failure to a business error (the single stderr line — the flag package's own output is silenced) |
 | `RenderError` | `err.Error()` | Renders a verb error as a single stderr line |
 | `HelpHeader` / `VerbTitle` / `HelpFooter` | `""` / `"commands:"` / `""` | Compose the help screen |
@@ -218,11 +219,11 @@ mytool verify --json=false .   # explicit false
 Details:
 
 - An `=value` form is honored when the value parses as a boolean
-  (`strconv.ParseBool`); anything else (e.g. `--json=yes`) stays in place
-  for verb-level parsing to reject.
+  (`strconv.ParseBool`); anything else — e.g. `--json=yes`, or the empty
+  value `--json=` — stays in place for verb-level parsing to reject.
 - Last occurrence wins per flag; a `--` terminator ends stripping.
-- `Run` panics on duplicate names or a collision with `RootFlag` —
-  assembly-time bugs, like `Register`'s panics.
+- `Run` panics on an empty name, a duplicate name, or a collision with
+  `RootFlag` — assembly-time bugs, like `Register`'s panics.
 
 ### `UsageError`
 
@@ -316,11 +317,13 @@ go test ./...
 The suite is table-driven on the standard `testing` package and covers
 flag/positional dispatch, root-flag stripping at any position (before the
 verb included, `--` terminator, last-occurrence-wins, Root preservation),
-usage errors with help, single-line flag-error rendering, the `FlagError`
-hook, bare-verb passthrough, `help` / `help <verb>` / `-h` behavior,
-nested subcommands, help composition, `Names()` ordering, and `Register`
-fail-fast panics. The `example_test.go` examples double as the README
-quick-start smoke test.
+bool root flag stripping (all forms, unparsable and empty `=value`
+passthrough, preset merge, configuration panics, value-form `-R`
+consuming a following token), usage errors with help, single-line
+flag-error rendering, the `FlagError` hook, bare-verb passthrough,
+`help` / `help <verb>` / `-h` behavior, nested subcommands, help
+composition, `Names()` ordering, and `Register` fail-fast panics. The
+`example_test.go` examples double as the README quick-start smoke test.
 
 ## License
 
@@ -339,7 +342,7 @@ quick-start smoke test.
 
 ## 特性
 
-- **零依赖** —— 纯标准库（`context`、`errors`、`flag`、`fmt`、`io`、`sort`、`strings`）
+- **零依赖** —— 纯标准库（`context`、`errors`、`flag`、`fmt`、`io`、`sort`、`strconv`、`strings`）
 - **声明式旗标** —— 动词实现 `Flagged.SetFlags` 即可；FlagSet 构造与解析错误映射由 App 单点承担，flag 包自身的诊断输出被静默，解析失败只经 `FlagError` 钩子渲染为 stderr 上的**单行**错误。未实现 `Flagged` 的动词参数原样透传
 - **全局根旗标** —— 置 `RootFlag: "R"` 后，`-R <值>` / `-R=<值>` / `--R=<值>` 在**任意位置**（含动词名之前）都被剥离（先于动词旗标解析），值经 `Environment.Root` 送达；遇到 `--` 终结符即停止剥离
 - **全局 bool 根旗标** —— `RootBoolFlags: []string{"json"}` 声明无值全局旗标（`-json`/`--json`，支持 `=true`/`=false`），任意位置剥离，值经 `Environment.RootBools` 送达
@@ -437,15 +440,21 @@ $ echo $?
 
 ```go
 type Environment struct {
-	Stdout io.Writer
-	Stderr io.Writer
-	Root   string // 全局根旗标的值；空 = 未提供
+	Stdout    io.Writer
+	Stderr    io.Writer
+	Root      string          // 全局根旗标的值；空 = 未提供
+	RootBools map[string]bool // 全局 bool 根旗标的解析结果
 }
 ```
 
 `Root` 是全局根旗标（`App.RootFlag`，如 `"R"`）的落点——框架只摘取
 不解释，语义（仓库根/工作区根……）由动词定义。旗标未出现时，调用方
 预先程序化设置的 `Root` 会被保留。
+
+`RootBools` 是全局 bool 根旗标（`App.RootBoolFlags`，如
+`[]string{"json"}`）的落点。key 仅在旗标被提供时存在；按
+`env.RootBools["json"]` 读取（缺 key 读作 `false`）。预设值会被保留，
+解析也绝不改动调用方传入的 map。
 
 ### `Command` 与 `Flagged`
 
@@ -494,6 +503,7 @@ error 由 `App.Run` 经 `RenderError` 渲染到 stderr 并映射退出码 `1`。
 | 字段 | 缺省 | 用途 |
 |---|---|---|
 | `RootFlag` | `""`（关闭） | 全局根旗标名；`"R"` 匹配任意位置的 `-R v` / `-R=v` / `--R=v`（含动词名之前），值落 `Environment.Root`。嵌套内层应置空——外层已剥离 |
+| `RootBoolFlags` | `nil`（关闭） | 全局无值 bool 旗标名；`"json"` 匹配任意位置的 `-json` / `--json` / `--json=<bool>`，值落 `Environment.RootBools`。嵌套内层应置空——外层已剥离 |
 | `FlagError` | `"%s: bad arguments: %v"` | 把旗标解析失败映射为业务错误（stderr 上的唯一一行——flag 包自身输出已静默） |
 | `RenderError` | `err.Error()` | 把动词错误渲染为 stderr 单行文案 |
 | `HelpHeader` / `VerbTitle` / `HelpFooter` | `""` / `"commands:"` / `""` | 组装帮助面 |
@@ -517,6 +527,45 @@ mytool echo hi --R=/root
   `-R /root` 作为字面参数传给动词。
 - 悬空的 `-R`（后面没有值）按*未提供*处理（`Root` 为空），交由动词
   自己的用法校验报错。
+
+### Bool 根旗标
+
+`RootBoolFlags: []string{"json"}` 声明无值全局 bool 旗标，任意位置
+（含动词名之前）剥离，值落入 `Environment.RootBools`：
+
+```console
+mytool --json verify .
+mytool verify --json .
+mytool verify --json=false .   # 显式 false
+```
+
+细节：
+
+- `=值` 形式仅在值能解析为布尔时生效（`strconv.ParseBool`）；其余
+  ——如 `--json=yes`，或空值 `--json=`——原样留在参数里，交由动词级
+  解析去报错。
+- 每个旗标最后一次生效；遇到 `--` 终结符即停止剥离。
+- `Run` 在名字为空、重名、或与 `RootFlag` 冲突时 panic——都是装配期
+  问题，与 `Register` 的快速失败同一精神。
+
+### `UsageError`
+
+动词把自己的参数校验失败标记为用法问题——照常渲染，并附上该动词的
+usage 行，退出码映射为 `2`（而非 `1`）：
+
+```go
+func (c *configCmd) Run(_ context.Context, _ *commands.Environment, args []string) error {
+	if c.path == "" {
+		return &commands.UsageError{Usage: c.Usage(), Err: errors.New("config: --config is required")}
+	}
+	// ...
+}
+```
+
+该错误可穿透 `fmt.Errorf("%w")` 包装与嵌套 `SubDispatch` 被识别。
+v0.2.0 起默认 `FlagError` 映射同样返回 `UsageError`，旗标解析失败
+因此退出 `2` 并附动词 usage 提示（自定义 `FlagError` 钩子仍握有
+完全控制权——返回什么错误就走什么退出路径）。
 
 ### help 与 `-h`
 
@@ -570,10 +619,12 @@ func (c *remoteCmd) Run(ctx context.Context, env *commands.Environment, args []s
 |---|---|---|
 | `0` | `ExitOK` | 成功（含：空参数 / `help` / `help <动词>` / `-h`） |
 | `1` | `ExitError` | 动词返回错误（含未知嵌套子动词） |
-| `2` | `ExitUsage` | 本层未知动词；向 stderr 附帮助面 |
+| `2` | `ExitUsage` | 用法错误：本层未知动词（附帮助面）、旗标解析失败（附 usage 行，v0.2.0 起）、动词声明的 `UsageError`（附 usage 提示） |
 
 `UnknownVerbError{Name}` 是分发未命中的错误形态；`App.Run` 据此
 选用法退出码并附帮助面，文案可经 `RenderError` 重写。
+`UsageError{Usage, Err}` 让动词级参数问题得到同样待遇——见
+[`UsageError`](#usageerror)。
 
 ## 测试
 
@@ -583,10 +634,12 @@ go test ./...
 
 测试基于标准 `testing` 包、表驱动，覆盖：旗标/位置参数分发、根旗标
 任意位置剥离（含动词名之前、`--` 终结符、重复取最后一次、`Root`
-保留）、用法错误附帮助面、旗标错误单行渲染、`FlagError` 钩子、无旗
-动词透传、`help` / `help <动词>` / `-h` 行为、嵌套子动词、帮助面组
-装、`Names()` 排序、`Register` 快速失败 panic。`example_test.go` 中
-的示例同时充当 README 快速开始的冒烟测试。
+保留）、bool 根旗标剥离（全部形态、不可解析与空 `=值` 透传、预设
+合并、配置 panic、值形式 `-R` 吞掉后续 token）、用法错误附帮助面、
+旗标错误单行渲染、`FlagError` 钩子、无旗动词透传、`help` /
+`help <动词>` / `-h` 行为、嵌套子动词、帮助面组装、`Names()` 排序、
+`Register` 快速失败 panic。`example_test.go` 中的示例同时充当
+README 快速开始的冒烟测试。
 
 ## 许可
 

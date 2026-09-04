@@ -430,9 +430,11 @@ func TestNestedSubcommands(t *testing.T) {
 	}
 }
 
-// boolSpy records the RootBools and positionals seen by Run.
+// boolSpy records the RootBools (copied), the Root, and the positionals
+// seen by Run. root may be nil.
 type boolSpy struct {
 	booleans map[string]bool
+	root     *string
 	pos      *string
 }
 
@@ -441,7 +443,12 @@ func (boolSpy) Synopsis() string { return "record bools" }
 func (boolSpy) Usage() string    { return "spy" }
 
 func (b boolSpy) Run(_ context.Context, env *Environment, args []string) error {
-	b.booleans["snapshot"] = env.RootBools["json"]
+	for k, v := range env.RootBools {
+		b.booleans[k] = v
+	}
+	if b.root != nil {
+		*b.root = env.Root
+	}
 	*b.pos = strings.Join(args, " ")
 	return nil
 }
@@ -462,6 +469,7 @@ func TestRootBoolFlags(t *testing.T) {
 		{"last wins", []string{"spy", "--json=false", "--json", "a"}, true, true, "a"},
 		{"absent", []string{"spy", "a"}, false, false, "a"},
 		{"unparsable value passes through", []string{"spy", "--json=yes", "a"}, false, false, "--json=yes|a"},
+		{"empty value passes through", []string{"spy", "--json=", "a"}, false, false, "--json=|a"},
 		{"terminator is literal", []string{"spy", "a", "--", "--json"}, false, false, "a|--|--json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -475,8 +483,14 @@ func TestRootBoolFlags(t *testing.T) {
 			if code != ExitOK {
 				t.Fatalf("exit code = %d, want 0", code)
 			}
-			if saw["snapshot"] != tc.wantJSON {
-				t.Fatalf("RootBools[json] = %v, want %v", saw["snapshot"], tc.wantJSON)
+			// A key is present only when the flag was provided: provided
+			// false (wantSet, !wantJSON) must stay distinct from absent.
+			got, set := saw["json"]
+			if set != tc.wantSet {
+				t.Fatalf("RootBools json key present = %v, want %v (saw %v)", set, tc.wantSet, saw)
+			}
+			if set && got != tc.wantJSON {
+				t.Fatalf("RootBools[json] = %v, want %v", got, tc.wantJSON)
 			}
 			if tc.wantPos != "" && strings.Join(strings.Fields(pos), "|") != tc.wantPos {
 				t.Fatalf("positionals = %q, want %q", pos, tc.wantPos)
@@ -504,6 +518,63 @@ func TestRootBoolFlagsMergeWithPreset(t *testing.T) {
 	}
 }
 
+func TestRootBoolFlagEmptyValueStaysInPlace(t *testing.T) {
+	// The empty "=value" does not parse as a boolean, so the token stays
+	// in place per the documented contract — wherever it appears.
+	app := New()
+	app.RootBoolFlags = []string{"json"}
+	app.Register(&echoCmd{})
+	var out, errOut bytes.Buffer
+	env := &Environment{Stdout: &out, Stderr: &errOut}
+
+	// Before the verb it is an ordinary token: a dispatch miss.
+	code := app.Run(context.Background(), env, []string{"--json=", "echo", "hi"})
+	if code != ExitUsage {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), `unknown verb "--json="`) {
+		t.Fatalf("stderr = %q, want unknown-verb message", errOut.String())
+	}
+
+	// After the verb, verb-level parsing owns the rejection.
+	errOut.Reset()
+	code = app.Run(context.Background(), env, []string{"echo", "--json=", "hi"})
+	if code != ExitUsage {
+		t.Fatalf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(errOut.String(), "flag provided but not defined: -json") {
+		t.Fatalf("stderr = %q, want the verb-level flag error", errOut.String())
+	}
+}
+
+func TestRootFlagValueConsumesDeclaredBoolFlag(t *testing.T) {
+	// A value-carrying -R blindly takes the next token, even when it is a
+	// declared bool root flag (v0.1.0 semantics, kept by the combined
+	// pass): the bool flag is not set.
+	var root string
+	saw := map[string]bool{}
+	pos := ""
+	app := New()
+	app.RootFlag = "R"
+	app.RootBoolFlags = []string{"json"}
+	app.Register(boolSpy{booleans: saw, root: &root, pos: &pos})
+	var out bytes.Buffer
+	code := app.Run(context.Background(), &Environment{Stdout: &out, Stderr: &out},
+		[]string{"-R", "--json", "spy", "a"})
+	if code != ExitOK {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if root != "--json" {
+		t.Fatalf("Root = %q, want %q (blind next-token consumption)", root, "--json")
+	}
+	if len(saw) != 0 {
+		t.Fatalf("RootBools = %v, want empty (the token was consumed as -R's value)", saw)
+	}
+	if pos != "a" {
+		t.Fatalf("positionals = %q, want %q", pos, "a")
+	}
+}
+
 func TestRootConfigValidationPanics(t *testing.T) {
 	app := New()
 	app.RootBoolFlags = []string{"json", "json"}
@@ -515,6 +586,11 @@ func TestRootConfigValidationPanics(t *testing.T) {
 	app2.RootBoolFlags = []string{"json"}
 	mustPanic(t, "duplicate root flag", func() {
 		app2.Run(context.Background(), &Environment{}, []string{"spy"})
+	})
+	app3 := New()
+	app3.RootBoolFlags = []string{""}
+	mustPanic(t, "empty root bool flag name", func() {
+		app3.Run(context.Background(), &Environment{}, []string{"spy"})
 	})
 }
 
