@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.2.1 (2026-09-05)
+
+Fixes the `--json=` contract violation shipped in v0.2.0 and adds the
+audit-recommended hardening (independent review of v0.2.0's mechanism
+quality).
 
 ### Fixed
 
@@ -8,6 +12,7 @@
   not parse as a boolean (`strconv.ParseBool("")` fails), so the token
   is left for verb-level parsing per the documented `=value` contract —
   it no longer counts as the valueless `-json` form setting `true`.
+  *(Note: this was a contract violation in v0.2.0 as shipped.)*
 
 ### Added
 
@@ -16,6 +21,15 @@
   empty and unparsable `=value` passthrough at both dispatch positions,
   a value-form `-R` consuming a following declared bool flag (v0.1.0
   semantics kept), and the empty-name configuration panic.
+- `validateRoot` also panics when a bool root-flag name collides with
+  `h` or `help` — those names are reserved for the conventional help
+  flags, and a root bool silently stripping them would disable the
+  top-level help screen.
+
+## v0.2.0 (2026-09-04)
+
+> **Erratum**: v0.2.0 as tagged violated its own `=value` contract for
+> the empty-value form (`--json=`); fixed in v0.2.1.
 
 ## v0.2.0 (2026-09-04)
 

@@ -592,6 +592,18 @@ func TestRootConfigValidationPanics(t *testing.T) {
 	mustPanic(t, "empty root bool flag name", func() {
 		app3.Run(context.Background(), &Environment{}, []string{"spy"})
 	})
+	// h/help are reserved for the conventional help flags: a root bool
+	// silently stripping them would disable the top-level help screen.
+	app4 := New()
+	app4.RootBoolFlags = []string{"h"}
+	mustPanic(t, "collides with the reserved help flag", func() {
+		app4.Run(context.Background(), &Environment{}, []string{"spy"})
+	})
+	app5 := New()
+	app5.RootBoolFlags = []string{"help"}
+	mustPanic(t, "collides with the reserved help flag", func() {
+		app5.Run(context.Background(), &Environment{}, []string{"spy"})
+	})
 }
 
 // usageCmd returns a UsageError, optionally wrapped the way real verbs

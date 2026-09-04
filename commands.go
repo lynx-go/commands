@@ -327,6 +327,9 @@ func (a *App) validateRoot() {
 		if n == "" {
 			panic("commands: empty root bool flag name")
 		}
+		if n == "h" || n == "help" {
+			panic(fmt.Sprintf("commands: root bool flag %q collides with the reserved help flag", n))
+		}
 		if seen[n] {
 			panic(fmt.Sprintf("commands: duplicate root flag %q", n))
 		}
